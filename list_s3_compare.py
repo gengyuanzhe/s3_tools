@@ -56,6 +56,17 @@ def uri_encode(s: str) -> str:
     return urllib.parse.quote(s, safe="-_.~")
 
 
+# 硬编码英文星期/月份, 避免 strftime 受系统 locale 影响(V2 签名要 RFC 1123 英文)
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def rfc1123_date(t: datetime.datetime) -> str:
+    return (f"{_WEEKDAYS[t.weekday()]}, {t.day:02d} {_MONTHS[t.month - 1]} "
+            f"{t.year} {t.hour:02d}:{t.minute:02d}:{t.second:02d} GMT")
+
+
 # ---------------- 统计 ----------------
 
 class Stats:
@@ -143,11 +154,21 @@ class S3Lister:
                     if sub.tag.split("}")[-1] == "Prefix":
                         common.append(sub.text)
                         break
+        is_truncated = findtext(root, "IsTruncated") == "true"
+        # V2 API(list-type=2): NextContinuationToken
+        # V1 API: NextMarker(有 delimiter 且截断时才有), 否则用最后一条 Key 作 marker
+        next_token = findtext(root, "NextContinuationToken")
+        if not next_token and is_truncated:
+            nm = findtext(root, "NextMarker")
+            if nm:
+                next_token = nm
+            elif contents:
+                next_token = contents[-1]
         return {
             "contents": contents,
             "common_prefixes": common,
-            "is_truncated": findtext(root, "IsTruncated") == "true",
-            "next_token": findtext(root, "NextContinuationToken"),
+            "is_truncated": is_truncated,
+            "next_token": next_token,
         }
 
     def _build_headers_v4(self, canonical_uri, canonical_query, host_header, payload_hash):
@@ -187,7 +208,7 @@ class S3Lister:
     def _build_headers_v2(self, canonical_resource, host_header):
         # V2: StringToSign = METHOD\nContent-MD5\nContent-Type\nDate\n(CanonicalizedAmzHeaders)\nCanonicalizedResource
         t = datetime.datetime.utcnow()
-        date_str = t.strftime("%a, %d %b %Y %H:%M:%S GMT")  # RFC 1123
+        date_str = rfc1123_date(t)
         string_to_sign = "\n".join(["GET", "", "", date_str, canonical_resource])
         sig = base64.b64encode(
             hmac.new(self.sk.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha1).digest()
@@ -238,13 +259,24 @@ class S3Lister:
         raise RuntimeError(f"request failed after retries: {last_err}")
 
     def list(self, prefix="", delimiter=None, token=None):
-        params = {"list-type": "2"}
-        if prefix:
-            params["prefix"] = prefix
-        if delimiter:
-            params["delimiter"] = delimiter
-        if token:
-            params["continuation-token"] = token
+        if self.sign == "v4":
+            # V4 签名 → ListObjectsV2(list-type=2 + continuation-token)
+            params = {"list-type": "2"}
+            if prefix:
+                params["prefix"] = prefix
+            if delimiter:
+                params["delimiter"] = delimiter
+            if token:
+                params["continuation-token"] = token
+        else:
+            # V2 签名 → ListObjectsV1(prefix + marker + max-keys + delimiter)
+            params = {"max-keys": "1000"}
+            if prefix:
+                params["prefix"] = prefix
+            if delimiter:
+                params["delimiter"] = delimiter
+            if token:
+                params["marker"] = token
         r, lat = self._list_once(params)
         self.stats.record(lat, len(r["contents"]), len(r["common_prefixes"]))
         return r
